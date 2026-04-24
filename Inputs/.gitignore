@@ -1,0 +1,6 @@
+# Ignore all CSV files in artifacts
+*.csv
+
+# But keep the directory structure
+!.gitignore
+!README.md
