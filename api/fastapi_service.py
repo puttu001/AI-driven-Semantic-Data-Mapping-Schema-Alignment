@@ -12,7 +12,7 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, StreamingResponse
 from pydantic import BaseModel, SecretStr, Field
 from typing import List, Dict, Optional, Any, Annotated, Literal
 import uvicorn
@@ -62,270 +62,9 @@ VECTOR_STORES = {}  # Store MongoDB vector search instances
 # Web- Interactive:UI
 # ==========================================================================
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/")
 async def root():
-    """Minimal UI for running mapping and downloading results"""
-    html_content = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>CDM Mapping </title>
-        <style>
-            body { font-family: Arial, sans-serif; max-width: 900px; margin: 40px auto; padding: 20px; }
-            h1 { color: #222; }
-            form { background: #f7f7f7; padding: 20px; border-radius: 8px; }
-            label { display: block; margin-top: 12px; font-weight: bold; }
-            input[type="text"], input[type="file"] { width: 100%; padding: 8px; margin-top: 5px; border: 1px solid #ddd; border-radius: 4px; }
-            button { margin-top: 16px; padding: 10px 18px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
-            button:disabled { background: #6c757d; cursor: not-allowed; }
-            .status { margin-top: 16px; padding: 12px; background: #eef5ff; border-radius: 6px; }
-            .downloads { margin-top: 16px; }
-            .error { background: #ffe6e6; }
-        </style>
-    </head>
-    <body>
-        <h1>CDM Mapping </h1>
-        <p style="background: #e8f5e9; padding: 10px; border-radius: 5px; margin-bottom: 20px;">
-            💡 <strong>Tip:</strong> CDM file is optional. If you've run <code>cdm_setup.py</code>, 
-            the CDM data is already in MongoDB. Just upload your mapping file!
-        </p>
-        <form id="mappingForm" enctype="multipart/form-data">
-            <label>OpenAI API Key (optional, uses .env if not provided):</label>
-            <input type="text" name="api_key" placeholder="sk-...">
-
-            <label>MongoDB URI (optional, uses .env if not provided):</label>
-            <input type="text" name="mongodb_uri" placeholder="mongodb+srv://...">
-
-            <label>CDM CSV File (optional - uses MongoDB if not provided):</label>
-            <input type="file" name="cdm_file" accept=".csv">
-
-            <label>Mapping CSV File: *</label>
-            <input type="file" name="mapping_file" accept=".csv" required>
-
-            <label style="margin-top:16px; font-weight: normal;">
-                <input type="checkbox" id="interactiveMode" checked>
-                Enable interactive review (includes challenger agent)
-            </label>
-
-            <button type="submit" id="runBtn">Run Mapping</button>
-        </form>
-
-        <div id="status" class="status" style="display:none;"></div>
-        <div id="review" class="status" style="display:none;"></div>
-        <div id="downloads" class="downloads" style="display:none;"></div>
-
-        <script>
-            const form = document.getElementById('mappingForm');
-            const statusEl = document.getElementById('status');
-            const reviewEl = document.getElementById('review');
-            const downloadsEl = document.getElementById('downloads');
-            const runBtn = document.getElementById('runBtn');
-            const interactiveMode = document.getElementById('interactiveMode');
-
-            let currentSessionId = null;
-
-            function renderSuggestion(suggestion, index, total) {
-                if (!suggestion) {
-                    reviewEl.innerHTML = '<strong>Review complete.</strong>'; 
-                    return;
-                }
-
-                const candidates = suggestion.llm_candidates || [];
-                let html = `<div><strong>Review ${index + 1} of ${total}</strong></div>`;
-                html += `<div style="margin-top:8px;"><strong>Table:</strong> ${suggestion.csv_table_name || ''}</div>`;
-                html += `<div><strong>Column:</strong> ${suggestion.csv_column_name || ''}</div>`;
-                html += `<div><strong>Description:</strong> ${suggestion.csv_column_description || ''}</div>`;
-
-                if (candidates.length) {
-                    html += '<div style="margin-top:10px;"><strong>Candidates:</strong></div>';
-                    html += '<ul>';
-                    candidates.forEach((c, i) => {
-                        const tableName = c.table_name ? ` — ${c.table_name}` : '';
-                        html += `<li><label><input type="radio" name="candidate" value="${i}"> ${c.term}${tableName} (Score: ${c.score})</label></li>`;
-                    });
-                    html += '</ul>';
-                } else {
-                    html += '<div><em>No candidates available.</em></div>';
-                }
-
-                html += `
-                    <div style="margin-top:10px;">
-                        <button type="button" id="acceptTopBtn">Accept Top</button>
-                        <button type="button" id="chooseBtn">Choose Selected</button>
-                        <button type="button" id="rejectBtn">Reject</button>
-                        <button type="button" id="skipBtn">Skip</button>
-                    </div>
-                `;
-
-                reviewEl.innerHTML = html;
-
-                document.getElementById('acceptTopBtn').onclick = () => submitDecision('accept_top');
-                document.getElementById('chooseBtn').onclick = () => {
-                    const selected = document.querySelector('input[name="candidate"]:checked');
-                    if (!selected) {
-                        alert('Select a candidate first.');
-                        return;
-                    }
-                    submitDecision('choose_candidate', parseInt(selected.value));
-                };
-                document.getElementById('rejectBtn').onclick = () => submitDecision('reject');
-                document.getElementById('skipBtn').onclick = () => submitDecision('skip');
-            }
-
-            // CHANGED: render recommendation decision UI
-            function renderRecommendation(suggestion, index, total, rec) {
-                let html = `<div><strong>Review ${index + 1} of ${total}</strong></div>`;
-                html += `<div style="margin-top:8px;"><strong>Table:</strong> ${suggestion.csv_table_name || ''}</div>`;
-                html += `<div><strong>Column:</strong> ${suggestion.csv_column_name || ''}</div>`;
-                html += `<div><strong>Description:</strong> ${suggestion.csv_column_description || ''}</div>`;
-
-                html += '<div style="margin-top:10px;"><strong>Suggested New Term:</strong></div>';
-                html += `<div><strong>${rec.recommended_column_name || 'N/A'}</strong> (Parent: ${rec.recommended_parent || 'N/A'}, Confidence: ${rec.confidence_score || 0})</div>`;
-                if (rec.reasoning) {
-                    html += `<div style="margin-top:6px;"><em>${rec.reasoning}</em></div>`;
-                }
-
-                html += `
-                    <div style="margin-top:10px;">
-                        <button type="button" id="acceptSuggestedBtn">Accept Suggested</button>
-                        <button type="button" id="rejectSuggestedBtn">Reject Suggested</button>
-                    </div>
-                `;
-
-                reviewEl.innerHTML = html;
-
-                document.getElementById('acceptSuggestedBtn').onclick = () => submitDecision('accept_suggested');
-                document.getElementById('rejectSuggestedBtn').onclick = () => submitDecision('reject_suggested');
-            }
-
-            async function fetchNextSuggestion() {
-                const res = await fetch('/api/v1/review/combined', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ session_id: currentSessionId })
-                });
-                const data = await res.json();
-                if (!res.ok) throw new Error(data.detail || 'Failed to fetch next suggestion');
-
-                if (data.done) {
-                    reviewEl.innerHTML = '<strong>Review complete.</strong>';
-                    if (data.output_files) {
-                        const mapped = data.output_files.mapped_file;
-                        const unmapped = data.output_files.unmapped_file;
-                        const excel = data.output_files.excel_file;
-                        const mappedLink = mapped ? `/api/v1/download?kind=mapped&filename=${encodeURIComponent(mapped)}` : null;
-                        const unmappedLink = unmapped ? `/api/v1/download?kind=unmapped&filename=${encodeURIComponent(unmapped)}` : null;
-                        const excelLink = excel ? `/api/v1/download?kind=excel&filename=${encodeURIComponent(excel)}` : null;
-
-                        let html = '<strong>Downloads:</strong><ul>';
-                        if (mappedLink) html += `<li><a href="${mappedLink}">Download Mapped CSV</a></li>`;
-                        if (unmappedLink) html += `<li><a href="${unmappedLink}">Download Unmapped CSV</a></li>`;
-                        if (excelLink) html += `<li><a href="${excelLink}">Download Logical Data Model (Excel)</a></li>`;
-                        html += '</ul>';
-
-                        downloadsEl.innerHTML = html;
-                        downloadsEl.style.display = 'block';
-                    }
-                    return;
-                }
-                if (data.awaiting_recommendation && data.recommendation) {
-                    renderRecommendation(data.suggestion, data.index, data.total, data.recommendation);
-                } else {
-                    renderSuggestion(data.suggestion, data.index, data.total);
-                }
-            }
-
-            async function submitDecision(action, candidateIndex = null) {
-                const payload = { session_id: currentSessionId, action, candidate_index: candidateIndex };
-                const res = await fetch('/api/v1/review/combined', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
-                });
-                const data = await res.json();
-                if (!res.ok) throw new Error(data.detail || 'Failed to submit decision');
-
-                if (data.done) {
-                    reviewEl.innerHTML = '<strong>Review complete.</strong>';
-                    if (data.output_files) {
-                        const mapped = data.output_files.mapped_file;
-                        const unmapped = data.output_files.unmapped_file;
-                        const excel = data.output_files.excel_file;
-                        const mappedLink = mapped ? `/api/v1/download?kind=mapped&filename=${encodeURIComponent(mapped)}` : null;
-                        const unmappedLink = unmapped ? `/api/v1/download?kind=unmapped&filename=${encodeURIComponent(unmapped)}` : null;
-                        const excelLink = excel ? `/api/v1/download?kind=excel&filename=${encodeURIComponent(excel)}` : null;
-
-                        let html = '<strong>Downloads:</strong><ul>';
-                        if (mappedLink) html += `<li><a href="${mappedLink}">Download Mapped CSV</a></li>`;
-                        if (unmappedLink) html += `<li><a href="${unmappedLink}">Download Unmapped CSV</a></li>`;
-                        if (excelLink) html += `<li><a href="${excelLink}">Download Logical Data Model (Excel)</a></li>`;
-                        html += '</ul>';
-
-                        downloadsEl.innerHTML = html;
-                        downloadsEl.style.display = 'block';
-                    }
-                } else {
-                    if (data.awaiting_recommendation && data.recommendation) {
-                        renderRecommendation(data.suggestion, data.index, data.total, data.recommendation);
-                    } else {
-                        renderSuggestion(data.suggestion, data.index, data.total);
-                    }
-                }
-            }
-
-            form.addEventListener('submit', async (e) => {
-                e.preventDefault();
-                statusEl.style.display = 'block';
-                statusEl.classList.remove('error');
-                statusEl.textContent = 'Processing... This may take several minutes.';
-                downloadsEl.style.display = 'none';
-                runBtn.disabled = true;
-
-                const formData = new FormData(form);
-                try {
-                    const endpoint = interactiveMode.checked ? '/api/v1/run-mapping-interactive' : '/api/v1/run-mapping-interactive';
-                    const response = await fetch(endpoint, { method: 'POST', body: formData });
-                    const data = await response.json();
-
-                    if (!response.ok) {
-                        throw new Error(data.detail || data.message || 'Request failed');
-                    }
-
-                    statusEl.textContent = data.message || 'Completed.';
-
-                    if (interactiveMode.checked) {
-                        currentSessionId = data.session_id;
-                        reviewEl.style.display = 'block';
-                        await fetchNextSuggestion();
-                    } else if (data.output_files) {
-                        const mapped = data.output_files.mapped_file;
-                        const unmapped = data.output_files.unmapped_file;
-                        const excel = data.output_files.excel_file;
-                        const mappedLink = mapped ? `/api/v1/download?kind=mapped&filename=${encodeURIComponent(mapped)}` : null;
-                        const unmappedLink = unmapped ? `/api/v1/download?kind=unmapped&filename=${encodeURIComponent(unmapped)}` : null;
-                        const excelLink = excel ? `/api/v1/download?kind=excel&filename=${encodeURIComponent(excel)}` : null;
-
-                        let html = '<strong>Downloads:</strong><ul>';
-                        if (mappedLink) html += `<li><a href="${mappedLink}">Download Mapped CSV</a></li>`;
-                        if (unmappedLink) html += `<li><a href="${unmappedLink}">Download Unmapped CSV</a></li>`;
-                        if (excelLink) html += `<li><a href="${excelLink}">Download Logical Data Model (Excel)</a></li>`;
-                        html += '</ul>';
-
-                        downloadsEl.innerHTML = html;
-                        downloadsEl.style.display = 'block';
-                    }
-                } catch (err) {
-                    statusEl.classList.add('error');
-                    statusEl.textContent = `Error: ${err.message}`;
-                } finally {
-                    runBtn.disabled = false;
-                }
-            });
-        </script>
-    </body>
-    </html>
-    """
-    return HTMLResponse(content=html_content)
+    return {'status: Running'}
 
 # ============================================================================
 # MODELS
@@ -463,6 +202,11 @@ class PostReviewKPIsResponse(BaseModel):
 
 
 INTERACTIVE_SESSIONS: Dict[str, Dict[str, Any]] = {}
+
+# Demo files source in MongoDB (used when uploads are not provided)
+DEMO_FILES_DB_NAME = "Data_mapping_demo_files"
+DEMO_MAPPING_COLLECTION = "input_mapping_file"
+DEMO_CDM_COLLECTION = "CDM_file"
 
 # ============================================================================
 # ENDPOINT 1: Initialize Embeddings
@@ -1174,13 +918,61 @@ def _load_cdm_from_mongodb(mongo_uri: str) -> pd.DataFrame:
     return df
 
 
+def _load_demo_file_from_mongodb(mongo_uri: str, collection_name: str, label: str) -> pd.DataFrame:
+    """Load demo CDM/mapping input from dedicated MongoDB demo collections."""
+    print(f"📥 Loading demo {label} from MongoDB collection '{collection_name}'...")
+
+    client = MongoClient(mongo_uri)
+    db = client[DEMO_FILES_DB_NAME]
+    collection = db[collection_name]
+    records = list(collection.find({}, {"_id": 0}))
+    client.close()
+
+    if not records:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No demo {label} data found in MongoDB "
+                f"{DEMO_FILES_DB_NAME}.{collection_name}."
+            )
+        )
+
+    first_record = records[0]
+
+    # Format A: one doc with CSV text/base64 payload
+    csv_text_key = next(
+        (k for k in ("csv_text", "csv_content", "content") if isinstance(first_record.get(k), str)),
+        None
+    )
+    if csv_text_key:
+        try:
+            return pd.read_csv(io.StringIO(first_record[csv_text_key]))
+        except Exception:
+            pass
+
+    # Format B: one doc with embedded rows list
+    rows = first_record.get("rows")
+    if isinstance(rows, list) and rows:
+        df = pd.DataFrame(rows)
+        print(f"✅ Loaded {len(df)} demo {label} rows from embedded list")
+        return df
+
+    # Format C: each Mongo document is one CSV row
+    df = pd.DataFrame(records)
+    if df.empty:
+        raise HTTPException(status_code=404, detail=f"Demo {label} data is empty")
+
+    print(f"✅ Loaded {len(df)} demo {label} rows from MongoDB")
+    return df
+
+
 def _run_mapping_interactive_sync(
     api_key: Optional[str],
     mongodb_uri: Optional[str],
     cdm_content: Optional[bytes],
     cdm_filename: Optional[str],
-    mapping_content: bytes,
-    mapping_filename: str
+    mapping_content: Optional[bytes],
+    mapping_filename: Optional[str]
 ):
     global EMBEDDINGS_INSTANCE
 
@@ -1204,11 +996,16 @@ def _run_mapping_interactive_sync(
         cdm_path = save_uploaded_file(cdm_content, cdm_filename, file_type='cdm')
         cdm_df = load_and_clean_csv_file(str(cdm_path))
     else:
-        print("💾 Using CDM data from MongoDB")
-        cdm_df = _load_cdm_from_mongodb(mongo_uri)
-    
-    mapping_path = save_uploaded_file(mapping_content, mapping_filename, file_type='mapping')
-    mapping_df = load_and_clean_csv_file(str(mapping_path))
+        print("💾 No CDM upload provided. Using demo CDM file from MongoDB")
+        cdm_df = _load_demo_file_from_mongodb(mongo_uri, DEMO_CDM_COLLECTION, "CDM")
+
+    if mapping_content and mapping_filename:
+        print("📁 Using uploaded mapping file")
+        mapping_path = save_uploaded_file(mapping_content, mapping_filename, file_type='mapping')
+        mapping_df = load_and_clean_csv_file(str(mapping_path))
+    else:
+        print("💾 No mapping upload provided. Using demo mapping file from MongoDB")
+        mapping_df = _load_demo_file_from_mongodb(mongo_uri, DEMO_MAPPING_COLLECTION, "mapping")
 
     if not validate_required_columns(cdm_df, [], "CDM"):
         raise HTTPException(status_code=400, detail="CDM file missing required columns")
@@ -1393,7 +1190,7 @@ async def run_mapping_interactive(
     api_key: str = Form(None),
     mongodb_uri: str = Form(None),
     cdm_file: UploadFile = File(None),
-    mapping_file: UploadFile = File(...)
+    mapping_file: UploadFile = File(None)
 ):
     """
     Process uploaded files and return a review session for user decisions.
@@ -1402,7 +1199,8 @@ async def run_mapping_interactive(
     try:
         cdm_content = await cdm_file.read() if cdm_file else None
         cdm_filename = cdm_file.filename if cdm_file else None
-        mapping_content = await mapping_file.read()
+        mapping_content = await mapping_file.read() if mapping_file else None
+        mapping_filename = mapping_file.filename if mapping_file else None
         return await asyncio.to_thread(
             _run_mapping_interactive_sync,
             api_key,
@@ -1410,7 +1208,7 @@ async def run_mapping_interactive(
             cdm_content,
             cdm_filename,
             mapping_content,
-            mapping_file.filename
+            mapping_filename
         )
     except HTTPException:
         raise
@@ -1691,6 +1489,30 @@ async def download_output(kind: str = "mapped", filename: Optional[str] = None):
         raise HTTPException(status_code=404, detail="File not found")
 
     return FileResponse(path=target, filename=target.name, media_type=media_type)
+
+
+@app.get("/api/v1/demo-files/download")
+async def download_demo_file(kind: str = "cdm"):
+    """Download demo CDM or mapping file sourced from MongoDB demo collections."""
+    kind_normalized = kind.lower().strip()
+    if kind_normalized not in {"cdm", "mapping"}:
+        raise HTTPException(status_code=400, detail="Invalid kind. Use 'cdm' or 'mapping'.")
+
+    mongo_uri = os.getenv("MONGODB_URI")
+    if not mongo_uri:
+        raise HTTPException(status_code=400, detail="MONGODB_URI missing from environment")
+
+    collection_name = DEMO_CDM_COLLECTION if kind_normalized == "cdm" else DEMO_MAPPING_COLLECTION
+    df = _load_demo_file_from_mongodb(
+        mongo_uri,
+        collection_name,
+        "CDM" if kind_normalized == "cdm" else "mapping"
+    )
+
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    output_name = f"demo_{kind_normalized}.csv"
+    headers = {"Content-Disposition": f'attachment; filename="{output_name}"'}
+    return StreamingResponse(io.BytesIO(csv_bytes), media_type="text/csv", headers=headers)
 # ============================================================================
 # HEALTH
 # ============================================================================
