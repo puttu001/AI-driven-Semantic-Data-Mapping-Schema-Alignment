@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Processing - AI semantic Data Mapping Intelligence Platform</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Serif:wght@400;600&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../styles/processing.css">
+</head>
+<body>
+    <div class="processing-container">
+        <!-- Header -->
+        <div class="processing-header">
+            <h1>Processing Data Mappings</h1>
+            <p class="session-info" id="sessionInfo">Session ID: <span id="sessionIdDisplay">-</span></p>
+        </div>
+
+        <!-- Main Content -->
+        <div class="processing-content">
+            <!-- Left: Processing Spinner -->
+            <div class="spinner-section">
+                <div class="spinner-wrapper">
+                    <svg class="spinner" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+                        <circle cx="50" cy="50" r="45" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-dasharray="141.4 141.4" stroke-dashoffset="0" opacity="0.2"/>
+                        <circle class="spinner-arc" cx="50" cy="50" r="45" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-dasharray="70.7 141.4" stroke-dashoffset="0"/>
+                    </svg>
+                    <div class="spinner-text">Processing</div>
+                </div>
+                <div class="progress-stats">
+                    <div class="stat-item">
+                        <span class="stat-label">Rows Processed</span>
+                        <span class="stat-value" id="rowsProcessed">0</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">Current Status</span>
+                        <span class="stat-value" id="currentStatus">Starting...</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right: Terminal Logs -->
+            <div class="logs-section">
+                <div class="logs-header">
+                    <span class="logs-title">Processing Logs</span>
+                    <button class="logs-clear-btn" id="clearLogsBtn" title="Clear logs">Clear</button>
+                </div>
+                <div class="terminal-output" id="terminalOutput" role="log" aria-live="polite" aria-label="Processing logs terminal">
+                    <div class="log-line initial">
+                        <span class="timestamp">[System]</span>
+                        <span class="message">Initializing mapping processor...</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Human Review Popup (Static Placeholder) -->
+    <div class="modal-overlay" id="humanReviewModal" hidden>
+        <div class="modal-content human-review-modal">
+            <div class="modal-header">
+                <h2>Processing Complete</h2>
+                <button class="modal-close" id="closeReviewModal" aria-label="Close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="completion-message">
+                    <svg class="success-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polyline points="20 6 9 17 4 12"></polyline>
+                    </svg>
+                    <h3>Pipeline Completed Successfully</h3>
+                    <p>All records have been processed and mapped. Your data is ready for review and final approval.</p>
+                    <div class="completion-stats">
+                        <div class="stat">
+                            <div class="stat-number" id="totalProcessed">0</div>
+                            <div class="stat-label">Total Processed</div>
+                        </div>
+                        <div class="stat">
+                            <div class="stat-number" id="totalMapped">0</div>
+                            <div class="stat-label">Successfully Mapped</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-primary" id="proceedToReviewBtn">Proceed to Review</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="../scripts/processing.js?v=20260428_2"></script>
+</body>
+</html>

@@ -13,6 +13,8 @@ if str(project_root) not in sys.path:
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, SecretStr, Field
 from typing import List, Dict, Optional, Any, Annotated, Literal
 import uvicorn
@@ -28,6 +30,8 @@ from pathlib import Path
 import time
 from datetime import datetime
 from dotenv import load_dotenv
+import traceback
+import contextlib
 
 from core.database import create_vector_search_index
 from config import settings
@@ -49,6 +53,19 @@ load_dotenv(override=True)
 app = FastAPI(title="CDM Mapping API Gateway - MongoDB")
 
 # ============================================================================
+# MIDDLEWARE & STATIC FILES
+# ============================================================================
+
+# Add CORS middleware for cross-origin requests
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ============================================================================
 # GLOBAL INSTANCES
 # ============================================================================
 
@@ -57,14 +74,59 @@ LLM_INSTANCE = None
 MONGODB_CLIENT = None
 MONGODB_DB = None
 VECTOR_STORES = {}  # Store MongoDB vector search instances
+PROCESSING_JOBS: Dict[str, Dict[str, Any]] = {}
+SESSION_LOGS: Dict[str, List[Dict[str, str]]] = {}
 
-# ==========================================================================
-# Web- Interactive:UI
-# ==========================================================================
 
-@app.get("/")
-async def root():
-    return {'status: Running'}
+def _append_session_log(session_id: str, stream: str, message: str) -> None:
+    text = (message or "").strip()
+    if not text:
+        return
+    if session_id not in SESSION_LOGS:
+        SESSION_LOGS[session_id] = []
+    SESSION_LOGS[session_id].append({
+        "timestamp": datetime.now().strftime("%H:%M:%S"),
+        "stream": stream,
+        "message": text
+    })
+
+
+class _SessionLogWriter:
+    """Capture print output for a session while still writing to process stdout/stderr."""
+
+    def __init__(self, session_id: str, stream_name: str):
+        self.session_id = session_id
+        self.stream_name = stream_name
+        self._buffer = ""
+
+    def write(self, data: str) -> int:
+        if not data:
+            return 0
+
+        if self.stream_name == "stderr":
+            sys.__stderr__.write(data)
+        else:
+            sys.__stdout__.write(data)
+
+        self._buffer += data
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            _append_session_log(self.session_id, self.stream_name, line.rstrip("\r"))
+        return len(data)
+
+    def flush(self) -> None:
+        if self.stream_name == "stderr":
+            sys.__stderr__.flush()
+        else:
+            sys.__stdout__.flush()
+
+        if self._buffer.strip():
+            _append_session_log(self.session_id, self.stream_name, self._buffer.rstrip("\r"))
+        self._buffer = ""
+
+# ============================================================================
+# API ROUTES
+# ============================================================================
 
 # ============================================================================
 # MODELS
@@ -159,36 +221,6 @@ class ReviewCombinedRequest(BaseModel):
     session_id: str
     action: Optional[Literal['accept_top','reject','choose_candidate','skip','accept_suggested','reject_suggested']] = None
     candidate_index: Optional[int] = None
-
-class APILatencyModel(BaseModel):
-    """API latency metrics"""
-    total_duration_seconds: float
-    avg_time_per_column_seconds: float
-    total_columns_processed: int
-
-class PreReviewKPIsModel(BaseModel):
-    """Pre-review KPI metrics"""
-    avg_confidence_score: float
-    accept_vs_reject_ratio: float
-    challenger_rejection_rate: float
-    acceptance_rate: float
-    api_latency: APILatencyModel
-
-class PreReviewBreakdownModel(BaseModel):
-    """Pre-review breakdown counts"""
-    total_mappings: int
-    accepted_mappings: int
-    rejected_mappings: int
-    unmapped_columns: int
-    auto_rejected: int
-    total_candidates_evaluated: int
-    challenger_rejected_count: int
-
-class PreReviewKPIsResponse(BaseModel):
-    """Complete pre-review KPI response"""
-    session_id: str
-    kpis: PreReviewKPIsModel
-    breakdown: PreReviewBreakdownModel
 
 class PostReviewKPIsResponse(BaseModel):
     """Post-review final results response"""
@@ -554,86 +586,6 @@ def _normalize_mongodb_uri(mongodb_uri: Optional[str]) -> Optional[str]:
     return candidate
 
 
-def _calculate_pre_review_kpis(session: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Calculate pre-review KPI metrics from session data.
-    Called before human review starts.
-    """
-    suggestions = session.get("suggestions", [])
-    auto_rejected = session.get("auto_rejected", [])
-    unmapped = session.get("unmapped_columns", [])
-    
-    # Calculate confidence scores from all suggestions with candidates
-    all_scores = []
-    total_candidates_evaluated = 0
-    challenger_rejected_count = 0
-    
-    for suggestion in suggestions:
-        llm_candidates = suggestion.get("llm_candidates", [])
-        for candidate in llm_candidates:
-            score = candidate.get("score", 0)
-            all_scores.append(score)
-            total_candidates_evaluated += 1
-            
-            # Count challenger rejections
-            verdict = candidate.get("challenger_verdict", "")
-            if verdict == "REJECT":
-                challenger_rejected_count += 1
-    
-    # Also count candidates from auto_rejected
-    for suggestion in auto_rejected:
-        llm_candidates = suggestion.get("llm_candidates", [])
-        for candidate in llm_candidates:
-            score = candidate.get("score", 0)
-            all_scores.append(score)
-            total_candidates_evaluated += 1
-            
-            verdict = candidate.get("challenger_verdict", "")
-            if verdict == "REJECT":
-                challenger_rejected_count += 1
-    
-    # Calculate metrics
-    avg_confidence_score = sum(all_scores) / len(all_scores) if all_scores else 0.0
-    
-    # Suggestions with at least one candidate that passed
-    accepted_mappings = len([s for s in suggestions if s.get("llm_candidates")])
-    rejected_mappings = len(auto_rejected)
-    total_mappings = accepted_mappings + rejected_mappings
-    
-    accept_vs_reject_ratio = accepted_mappings / rejected_mappings if rejected_mappings > 0 else float(accepted_mappings)
-    challenger_rejection_rate = (challenger_rejected_count / total_candidates_evaluated * 100) if total_candidates_evaluated > 0 else 0.0
-    acceptance_rate = (accepted_mappings / total_mappings * 100) if total_mappings > 0 else 0.0
-    
-    # Timing metrics
-    workflow_duration = session.get("workflow_duration_seconds", 0.0)
-    total_columns = session.get("total_columns_processed", 0)
-    avg_time_per_column = workflow_duration / total_columns if total_columns > 0 else 0.0
-    
-    return {
-        "session_id": session.get("session_id", "unknown"),
-        "kpis": {
-            "avg_confidence_score": round(avg_confidence_score, 2),
-            "accept_vs_reject_ratio": round(accept_vs_reject_ratio, 2),
-            "challenger_rejection_rate": round(challenger_rejection_rate, 2),
-            "acceptance_rate": round(acceptance_rate, 2),
-            "api_latency": {
-                "total_duration_seconds": round(workflow_duration, 2),
-                "avg_time_per_column_seconds": round(avg_time_per_column, 2),
-                "total_columns_processed": total_columns
-            }
-        },
-        "breakdown": {
-            "total_mappings": total_mappings,
-            "accepted_mappings": accepted_mappings,
-            "rejected_mappings": rejected_mappings,
-            "unmapped_columns": len(unmapped),
-            "auto_rejected": len(auto_rejected),
-            "total_candidates_evaluated": total_candidates_evaluated,
-            "challenger_rejected_count": challenger_rejected_count
-        }
-    }
-
-
 def _generate_executive_summary(session: Dict[str, Any], kpis: Dict[str, Any]) -> str:
     """
     Generate executive summary using LLM.
@@ -665,7 +617,7 @@ def _generate_executive_summary(session: Dict[str, Any], kpis: Dict[str, Any]) -
         final_mappings = session.get("final_mappings", [])
         unmapped = session.get("unmapped_columns", [])
         
-        # Pre-review stats
+        # Session stats
         total_proposed = len(suggestions) + len(auto_rejected)
         challenger_accepted = len(suggestions)
         challenger_rejected = len(auto_rejected)
@@ -972,7 +924,8 @@ def _run_mapping_interactive_sync(
     cdm_content: Optional[bytes],
     cdm_filename: Optional[str],
     mapping_content: Optional[bytes],
-    mapping_filename: Optional[str]
+    mapping_filename: Optional[str],
+    session_id: Optional[str] = None
 ):
     global EMBEDDINGS_INSTANCE
 
@@ -1127,7 +1080,8 @@ def _run_mapping_interactive_sync(
 
 
 
-    session_id = f"session_{int(time.time())}"
+    if not session_id:
+        session_id = f"session_{int(time.time())}"
     INTERACTIVE_SESSIONS[session_id] = {
         "session_id": session_id,  # Store session_id in the session itself
         "suggestions": suggestions,
@@ -1178,7 +1132,73 @@ def _run_mapping_interactive_sync(
     elif validation_report and "error" in validation_report:
         response_data["validation"] = {"error": validation_report["error"]}
     
-    return JSONResponse(content=response_data)
+    return response_data
+
+
+def _run_mapping_interactive_background_job(
+    session_id: str,
+    api_key: Optional[str],
+    mongodb_uri: Optional[str],
+    cdm_content: Optional[bytes],
+    cdm_filename: Optional[str],
+    mapping_content: Optional[bytes],
+    mapping_filename: Optional[str]
+) -> None:
+    """Run the interactive mapping flow in a worker thread and update job status."""
+    PROCESSING_JOBS[session_id] = {
+        "status": "running",
+        "message": "Mapping process started",
+        "started_at": time.time(),
+        "done": False
+    }
+    _append_session_log(session_id, "stdout", "Mapping process started")
+
+    try:
+        stdout_writer = _SessionLogWriter(session_id, "stdout")
+        stderr_writer = _SessionLogWriter(session_id, "stderr")
+        with contextlib.redirect_stdout(stdout_writer), contextlib.redirect_stderr(stderr_writer):
+            result = _run_mapping_interactive_sync(
+                api_key,
+                mongodb_uri,
+                cdm_content,
+                cdm_filename,
+                mapping_content,
+                mapping_filename,
+                session_id
+            )
+
+        stdout_writer.flush()
+        stderr_writer.flush()
+        PROCESSING_JOBS[session_id].update({
+            "status": "completed",
+            "message": "Suggestions generated. Start review.",
+            "done": True,
+            "completed_at": time.time(),
+            "result": result,
+            "total_suggestions": result.get("total_suggestions", 0),
+            "auto_rejected_count": result.get("auto_rejected_count", 0),
+            "unmapped_count": result.get("unmapped_count", 0)
+        })
+        _append_session_log(session_id, "stdout", "Suggestions generated. Start review.")
+    except HTTPException as e:
+        PROCESSING_JOBS[session_id].update({
+            "status": "failed",
+            "message": str(e.detail),
+            "done": True,
+            "completed_at": time.time(),
+            "error": str(e.detail)
+        })
+        _append_session_log(session_id, "stderr", f"Processing failed: {str(e.detail)}")
+    except Exception as e:
+        traceback.print_exc()
+        PROCESSING_JOBS[session_id].update({
+            "status": "failed",
+            "message": f"Processing error: {str(e)}",
+            "done": True,
+            "completed_at": time.time(),
+            "error": str(e)
+        })
+        _append_session_log(session_id, "stderr", f"Processing error: {str(e)}")
 
 
 # ==========================================================================
@@ -1197,25 +1217,77 @@ async def run_mapping_interactive(
     Includes challenger agent via LLM evaluation.
     """
     try:
+        session_id = f"session_{int(time.time() * 1000)}"
+        SESSION_LOGS[session_id] = []
+        PROCESSING_JOBS[session_id] = {
+            "status": "queued",
+            "message": "Request accepted. Preparing mapping process...",
+            "created_at": time.time(),
+            "done": False
+        }
+        _append_session_log(session_id, "stdout", "Request accepted. Preparing mapping process...")
+
         cdm_content = await cdm_file.read() if cdm_file else None
         cdm_filename = cdm_file.filename if cdm_file else None
         mapping_content = await mapping_file.read() if mapping_file else None
         mapping_filename = mapping_file.filename if mapping_file else None
-        return await asyncio.to_thread(
-            _run_mapping_interactive_sync,
+
+        asyncio.create_task(asyncio.to_thread(
+            _run_mapping_interactive_background_job,
+            session_id,
             api_key,
             mongodb_uri,
             cdm_content,
             cdm_filename,
             mapping_content,
             mapping_filename
-        )
+        ))
+
+        return JSONResponse(status_code=202, content={
+            "status": "accepted",
+            "message": "Mapping job started. Poll session status for updates.",
+            "session_id": session_id,
+            "done": False
+        })
     except HTTPException:
         raise
     except Exception as e:
-        import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
+
+
+@app.get("/api/v1/sessions/{session_id}/logs")
+async def get_session_logs(session_id: str, from_index: int = 0, limit: int = 200):
+    """Return incremental logs and current processing status for one mapping session."""
+    job = PROCESSING_JOBS.get(session_id)
+    session = INTERACTIVE_SESSIONS.get(session_id)
+
+    if not job and not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    logs = SESSION_LOGS.get(session_id, [])
+    safe_from = max(0, from_index)
+    safe_limit = max(1, min(limit, 500))
+    selected_logs = logs[safe_from:safe_from + safe_limit]
+    next_index = safe_from + len(selected_logs)
+
+    status = job.get("status", "completed") if job else "completed"
+    done = bool(job.get("done", bool(session))) if job else bool(session)
+    result = job.get("result", {}) if job else {}
+
+    return JSONResponse(content={
+        "session_id": session_id,
+        "status": status,
+        "done": done,
+        "message": job.get("message", "") if job else "",
+        "logs": selected_logs,
+        "next_index": next_index,
+        "total_logs": len(logs),
+        "has_more": next_index < len(logs),
+        "total_suggestions": result.get("total_suggestions", len(session.get("suggestions", [])) if session else 0),
+        "auto_rejected_count": result.get("auto_rejected_count", len(session.get("auto_rejected", [])) if session else 0),
+        "unmapped_count": result.get("unmapped_count", len(session.get("unmapped_columns", [])) if session else 0)
+    })
 
 
 
@@ -1413,26 +1485,8 @@ async def review_combined(request: ReviewCombinedRequest):
     return _review_next_response(session)
 
 # ==========================================================================
-# ENDPOINT 7: KPI Endpoints
+# ENDPOINT 7: Final KPI Endpoint
 # ==========================================================================
-
-@app.get("/api/v1/kpis/session/{session_id}", response_model=PreReviewKPIsResponse)
-async def get_pre_review_kpis(session_id: str):
-    """
-    Get pre-review KPI metrics for a session.
-    Call this before human review starts to see proposer/challenger metrics.
-    """
-    session = INTERACTIVE_SESSIONS.get(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    try:
-        kpis_data = _calculate_pre_review_kpis(session)
-        return PreReviewKPIsResponse(**kpis_data)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error calculating KPIs: {str(e)}")
-
-
 @app.get("/api/v1/kpis/session/{session_id}/final", response_model=PostReviewKPIsResponse)
 async def get_post_review_kpis(session_id: str):
     """
@@ -1447,7 +1501,7 @@ async def get_post_review_kpis(session_id: str):
     if session.get("index", 0) == 0 and not session.get("final_mappings"):
         raise HTTPException(
             status_code=400, 
-            detail="Review has not started yet. Use /api/v1/kpis/session/{session_id} for pre-review metrics."
+            detail="Review has not started yet. Final KPIs are available only after mapping review is completed."
         )
     
     try:
@@ -1549,6 +1603,41 @@ async def health():
     }
 
 
+# ============================================================================
+# FRONTEND SERVING
+# ============================================================================
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_index():
+    """Serve the main frontend page (index.html)"""
+    frontend_index = Path(__file__).resolve().parent.parent / "frontend" / "index.html"
+    if frontend_index.exists():
+        return frontend_index.read_text()
+    return "<h1>Welcome to CDM Mapping</h1><p>Frontend not found at {}</p>".format(frontend_index)
+
+@app.get("/pages/{page_name}", response_class=HTMLResponse)
+async def serve_page(page_name: str):
+    """Serve HTML pages from frontend/pages directory"""
+    # Security: only allow specific characters in page name
+    if not all(c.isalnum() or c in '._-' for c in page_name):
+        raise HTTPException(status_code=400, detail="Invalid page name")
+    
+    page_path = Path(__file__).resolve().parent.parent / "frontend" / "pages" / page_name
+    if page_path.exists() and page_path.is_file():
+        return page_path.read_text()
+    raise HTTPException(status_code=404, detail="Page not found")
+
+# Mount static assets (styles, scripts)
+frontend_path = Path(__file__).resolve().parent.parent / "frontend"
+if frontend_path.exists():
+    styles_path = frontend_path / "styles"
+    if styles_path.exists():
+        app.mount("/styles", StaticFiles(directory=styles_path), name="styles")
+    
+    scripts_path = frontend_path / "scripts"
+    if scripts_path.exists():
+        app.mount("/scripts", StaticFiles(directory=scripts_path), name="scripts")
+
 
 # ============================================================================
 # MAIN
@@ -1566,7 +1655,6 @@ if __name__ == "__main__":
     print("💾 /api/v1/mongodb/save-mappings")
     print("🧭 /api/v1/run-mapping-interactive (POST with file upload)")
     print("🧩 /api/v1/review/combined")
-    print("📈 /api/v1/kpis/session/{session_id} (GET pre-review KPIs)")
     print("📊 /api/v1/kpis/session/{session_id}/final (GET post-review KPIs)")
     print("⬇️  /api/v1/download (GET mapped/unmapped)")
     print("�💚 /health (includes inputs info)")

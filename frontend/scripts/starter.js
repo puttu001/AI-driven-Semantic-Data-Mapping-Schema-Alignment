@@ -16,13 +16,11 @@ const defaultMappingLabel = "Drop file or click to upload";
 
 let usingDemoFiles = false;
 let isSubmitting = false;
-const shouldUseLocalBackend =
-  window.location.protocol === "file:" ||
-  !(["localhost", "127.0.0.1"].includes(window.location.hostname) && window.location.port === "8000");
-const apiBaseUrl = shouldUseLocalBackend ? "http://localhost:8000" : "";
 
 function buildApiUrl(path) {
-  return `${apiBaseUrl}${path}`;
+  // Since frontend is now served from FastAPI backend,
+  // all API calls should be to the same server
+  return path;
 }
 
 function updateFileLabel(inputElement, labelElement, fallbackText) {
@@ -142,25 +140,42 @@ async function runMappingProcess(event) {
   }
 
   try {
-    const response = await fetch(buildApiUrl("/api/v1/run-mapping-interactive"), {
+    const apiUrl = buildApiUrl("/api/v1/run-mapping-interactive");
+    console.log("📤 Sending request to:", apiUrl);
+    
+    const response = await fetch(apiUrl, {
       method: "POST",
       body: requestFormData
     });
 
+    console.log("📥 Response status:", response.status);
+    
     const payload = await response.json().catch(() => ({}));
+    console.log("📦 Response payload:", payload);
+    
     if (!response.ok) {
       throw new Error(payload.detail || payload.message || "Failed to start mapping process.");
     }
 
     const sessionId = payload.session_id || "n/a";
+    console.log("✅ Session ID received:", sessionId);
+    
     localStorage.setItem("mapping_session_id", sessionId);
     localStorage.setItem("mapping_input_mode", usingDemoFiles ? "demo" : "upload");
 
     setStatus(
-      `Mapping started successfully. Session ID: ${sessionId}.`,
+      `Mapping started successfully. Session ID: ${sessionId}. Redirecting...`,
       "success"
     );
+
+    console.log("⏱️  Setting redirect timer for 1 second...");
+    
+    // Navigate to processing page immediately
+    const redirectUrl = `/pages/processing.html?t=${Date.now()}`;
+    console.log("🔄 Redirecting to:", redirectUrl, "Current URL:", window.location.href);
+    window.location.href = redirectUrl;
   } catch (error) {
+    console.error("❌ Error during submission:", error);
     setStatus(error.message || "Unexpected error while starting mapping process.", "error");
   } finally {
     isSubmitting = false;
